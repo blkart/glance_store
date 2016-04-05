@@ -213,3 +213,7 @@ class InvalidParameterValue(Invalid):
 class InvalidImageStatusTransition(Invalid):
     message = _("Image status transition from %(cur_status)s to"
                 " %(new_status)s is not allowed")
+
+
+class ImageUnacceptable(Invalid):
+    message = _("Image %(image_id)s is unacceptable: %(reason)s")

@@ -23,6 +23,8 @@ import logging
 import math
 import urllib
 
+from eventlet import tpool
+
 from oslo.config import cfg
 
 from glance_store.common import utils
@@ -31,6 +33,8 @@ from glance_store import exceptions
 from glance_store import i18n
 from glance_store.i18n import _
 from glance_store import location
+
+from glance.openstack.common import excutils
 
 try:
     import rados
@@ -404,3 +408,158 @@ class Store(driver.Store):
         loc = location.store_location
         target_pool = loc.pool or self.pool
         self._delete_image(target_pool, loc.image, loc.snapshot)
+
+    def clone_volume_snapshot_to_image(self, volume_location, image_id):
+        fsid, pool, image, snapshot = self.parse_url(volume_location)
+        dest_name = str(image_id)
+        LOG.debug('cloning %(pool)s/%(img)s@%(snap)s to '
+                  '%(dest_pool)s/%(dest_name)s',
+                  dict(pool=pool, img=image, snap=snapshot,
+                       dest_pool=self.pool, dest_name=dest_name))
+
+        with RADOSClient(self, str(pool)) as src_client:
+            with RADOSClient(self, self.pool) as dest_client:
+                rbd.RBD().clone(src_client.ioctx,
+                                     image.encode('utf-8'),
+                                     snapshot.encode('utf-8'),
+                                     dest_client.ioctx,
+                                     dest_name,
+                                     features=rbd.RBD_FEATURE_LAYERING)
+                # create image snapshot and protect it
+                with RBDImageProxy(self, image_id, pool=self.pool) as image:
+                    tpool.execute(image.create_snap, 'snap')
+                    tpool.execute(image.protect_snap, 'snap')
+
+        image_prefix = 'rbd://'
+        image_location = '%s%s/%s/%s/snap' % (image_prefix, fsid, self.pool,
+                                              image_id)
+        return image_location
+
+    def image_flatten(self, image_id):
+        """"Flattens" a snapshotted image with the parents' data,
+        effectively detaching it from the parent.
+        """
+        LOG.debug('flattening %s', image_id)
+        with RBDImageProxy(self, image_id, pool=self.pool) as image:
+            tpool.execute(image.flatten)
+
+    def _connect_to_rados(self, pool=None):
+        client = rados.Rados(rados_id=self.user,
+                             conffile=self.conf_file)
+        try:
+            client.connect()
+            pool_to_open = pool or self.pool
+            ioctx = client.open_ioctx(pool_to_open.encode('utf-8'))
+            return client, ioctx
+        except rados.Error:
+            # shutdown cannot raise an exception
+            client.shutdown()
+            raise
+
+    def _disconnect_from_rados(self, client, ioctx):
+        # closing an ioctx cannot raise an exception
+        ioctx.close()
+        client.shutdown()
+
+    def parse_url(self, url):
+        prefix = 'rbd://'
+        if not url.startswith(prefix):
+            reason = _('Not stored in rbd')
+            raise exceptions.ImageUnacceptable(image_id=url, reason=reason)
+        pieces = map(urllib.unquote, url[len(prefix):].split('/'))
+        if '' in pieces:
+            reason = _('Blank components')
+            raise exceptions.ImageUnacceptable(image_id=url, reason=reason)
+        if len(pieces) != 4:
+            reason = _('Not an rbd snapshot')
+            raise exceptions.ImageUnacceptable(image_id=url, reason=reason)
+        return pieces
+
+    def _get_fsid(self):
+        with RADOSClient(self) as client:
+            return client.cluster.get_fsid()
+
+    def is_cloneable(self, volume_location):
+        try:
+            fsid, pool, volume, snapshot = self.parse_url(volume_location)
+        except exceptions.ImageUnacceptable as e:
+            LOG.debug('not cloneable: %s', e)
+            return False
+
+        if self._get_fsid() != fsid:
+            reason = '%s is in a different ceph cluster' % volume_location
+            LOG.debug(reason)
+            return False
+
+        # check that we can read the volume
+        try:
+            return self.exists(volume, pool=pool, snapshot=snapshot)
+        except rbd.Error as e:
+            LOG.debug('Unable to open volume %(loc)s: %(err)s' %
+                      dict(loc=url, err=e))
+            return False
+
+    def exists(self, name, pool=None, snapshot=None):
+        try:
+            with RBDImageProxy(self, name,
+                                pool=pool,
+                                snapshot=snapshot,
+                                read_only=True):
+                return True
+        except rbd.ImageNotFound:
+            return False
+
+class RADOSClient(object):
+    """Context manager to simplify error handling for connecting to ceph."""
+    def __init__(self, driver, pool=None):
+        self.driver = driver
+        self.cluster, self.ioctx = driver._connect_to_rados(pool)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type_, value, traceback):
+        self.driver._disconnect_from_rados(self.cluster, self.ioctx)
+
+class RBDImageProxy(object):
+    """Context manager for dealing with an existing rbd volume.
+
+    This handles connecting to rados and opening an ioctx automatically, and
+    otherwise acts like a librbd Image object.
+
+    The underlying librados client and ioctx can be accessed as the attributes
+    'client' and 'ioctx'.
+    """
+    def __init__(self, driver, name, pool=None, snapshot=None,
+                 read_only=False):
+        client, ioctx = driver._connect_to_rados(pool)
+        try:
+            snap_name = snapshot.encode('utf8') if snapshot else None
+            self.image = rbd.Image(ioctx, name.encode('utf8'),
+                                   snapshot=snap_name,
+                                   read_only=read_only)
+        except rbd.ImageNotFound:
+            with excutils.save_and_reraise_exception():
+                LOG.debug("rbd image %s does not exist", name)
+                driver._disconnect_from_rados(client, ioctx)
+        except rbd.Error:
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_LE("error opening rbd image %s"), name)
+                driver._disconnect_from_rados(client, ioctx)
+
+        self.driver = driver
+        self.client = client
+        self.ioctx = ioctx
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type_, value, traceback):
+        try:
+            self.image.close()
+        finally:
+            self.driver._disconnect_from_rados(self.client, self.ioctx)
+
+    def __getattr__(self, attrib):
+        return getattr(self.image, attrib)
+

@@ -375,3 +375,14 @@ def set_acls(location_uri, public=False, read_tenants=[],
                        context=context)
     except NotImplementedError:
         LOG.debug(_("Skipping store.set_acls... not implemented."))
+
+def clone_image_from_volume_snapshot(location, image_id):
+    scheme = get_store_from_location(location)
+    store = get_store_from_scheme(scheme)
+
+    if store.is_cloneable(location):
+        image_location = store.clone_volume_snapshot_to_image(location, image_id)
+        store.image_flatten(image_id)
+    else:
+        image_location = location
+    return image_location
